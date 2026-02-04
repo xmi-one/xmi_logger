@@ -56,8 +56,8 @@ setup(
         ],
     },
     project_urls={
-        "Bug Reports": "https://github.com/wang-zhibo/xmi_logger/issues",
-        "Source": "https://github.com/wang-zhibo/xmi_logger",
+        "Bug Reports": "https://github.com/xmi-one/xmi_logger/issues",
+        "Source": "https://github.com/xmi-one/xmi_logger",
     },
 )
 

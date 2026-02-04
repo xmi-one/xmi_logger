@@ -15,7 +15,7 @@
 ## 安装
 
 ```bash
-pip install xmi_logger
+ pip install -U xmi_logger
 ```
 
 ## 快速开始

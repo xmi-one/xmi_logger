@@ -20,7 +20,7 @@ from functools import wraps
 from time import perf_counter
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import threading
 
@@ -159,6 +159,8 @@ class XmiLogger:
                 request_id=self.request_id_var.get() or "no-request-id"
             )
         )
+        # 缓存常用的 opt(depth=1)，减少热路径对象创建开销
+        self._logger_d1 = self.logger.opt(depth=1)
         if work_type:
             self.enqueue = False
             self.diagnose = False
@@ -179,6 +181,7 @@ class XmiLogger:
         self.configure_logger()
 
         self._stats_lock = threading.Lock()
+        self._error_history_size = 200
         self._stats = {
             'total': 0,
             'error': 0,
@@ -187,7 +190,7 @@ class XmiLogger:
             'debug': 0,
             'by_category': defaultdict(int),
             'by_hour': defaultdict(int),
-            'errors': [],
+            'errors': deque(maxlen=self._error_history_size),
             'last_error_time': None,
             'error_rate': 0.0
         }
@@ -293,6 +296,9 @@ class XmiLogger:
             # 设置异常处理器
             if self._exception_hook_enabled:
                 self.setup_exception_handler()
+
+            # 重新缓存 opt(depth=1)，确保使用最新的 logger 配置
+            self._logger_d1 = self.logger.opt(depth=1)
             
         except Exception as e:
             # 如果配置失败，使用基本配置
@@ -418,7 +424,7 @@ class XmiLogger:
             tag: 标签名称
         """
         self._update_stats(level)
-        logger_opt = self.logger.opt(depth=1)
+        logger_opt = self._logger_d1
         log_method = getattr(logger_opt, level.lower(), logger_opt.info)
         tagged_message = self._msg('LOG_TAGGED', tag=tag, message=message)
         log_method(tagged_message)
@@ -433,7 +439,7 @@ class XmiLogger:
             category: 分类名称
         """
         self._update_stats(level, category=category)
-        logger_opt = self.logger.opt(depth=1)
+        logger_opt = self._logger_d1
         log_method = getattr(logger_opt, level.lower(), logger_opt.info)
         categorized_message = self._msg('LOG_CATEGORY', category=category, message=message)
         log_method(categorized_message)
@@ -666,36 +672,36 @@ class XmiLogger:
         Args:
             level (str): 日志级别方法名称。
         """
-        logger_method = getattr(self.logger.opt(depth=1), level)
+        logger_method = getattr(self._logger_d1, level)
         return logger_method
 
     def log(self, level: str, message: str, *args, **kwargs):
         self._update_stats(level)
-        return self.logger.opt(depth=1).log(level, message, *args, **kwargs)
+        return self._logger_d1.log(level, message, *args, **kwargs)
 
     def debug(self, message: str, *args, **kwargs):
         self._update_stats("DEBUG")
-        return self.logger.opt(depth=1).debug(message, *args, **kwargs)
+        return self._logger_d1.debug(message, *args, **kwargs)
 
     def info(self, message: str, *args, **kwargs):
         self._update_stats("INFO")
-        return self.logger.opt(depth=1).info(message, *args, **kwargs)
+        return self._logger_d1.info(message, *args, **kwargs)
 
     def warning(self, message: str, *args, **kwargs):
         self._update_stats("WARNING")
-        return self.logger.opt(depth=1).warning(message, *args, **kwargs)
+        return self._logger_d1.warning(message, *args, **kwargs)
 
     def error(self, message: str, *args, **kwargs):
         self._update_stats("ERROR")
-        return self.logger.opt(depth=1).error(message, *args, **kwargs)
+        return self._logger_d1.error(message, *args, **kwargs)
 
     def critical(self, message: str, *args, **kwargs):
         self._update_stats("CRITICAL")
-        return self.logger.opt(depth=1).critical(message, *args, **kwargs)
+        return self._logger_d1.critical(message, *args, **kwargs)
 
     def exception(self, message: str, *args, **kwargs):
         self._update_stats("ERROR")
-        return self.logger.opt(depth=1).exception(message, *args, **kwargs)
+        return self._logger_d1.exception(message, *args, **kwargs)
 
     def log_decorator(self, msg: Optional[str] = None, level: str = "ERROR", trace: bool = True):
         """
@@ -887,25 +893,25 @@ class XmiLogger:
             return
             
         with self._stats_lock:
+            now_dt = datetime.now()
             self._stats['total'] += 1
-            self._stats[level.lower()] += 1
+            level_key = level.lower()
+            if level_key not in self._stats:
+                self._stats[level_key] = 0
+            self._stats[level_key] += 1
             
             if category:
                 self._stats['by_category'][category] += 1
             
-            current_hour = datetime.now().strftime('%Y-%m-%d %H:00')
+            current_hour = now_dt.strftime('%Y-%m-%d %H:00')
             self._stats['by_hour'][current_hour] += 1
             
             if level.upper() == 'ERROR':
                 self._stats['errors'].append({
-                    'time': datetime.now(),
+                    'time': now_dt,
                     'message': f"Error occurred at {current_hour}"
                 })
-                self._stats['last_error_time'] = datetime.now()
-                
-                # 计算错误率
-                if self._stats['total'] > 0:
-                    self._stats['error_rate'] = self._stats['error'] / self._stats['total']
+                self._stats['last_error_time'] = now_dt
     
     def get_stats(self) -> Dict[str, Any]:
         """获取详细的日志统计信息，优化性能"""
@@ -916,16 +922,19 @@ class XmiLogger:
             return self._stats_cache.copy()
         
         with self._stats_lock:
+            total = int(self._stats.get('total', 0))
+            error = int(self._stats.get('error', 0))
+            error_rate = (error / total) if total else 0.0
             stats = {
-                'total': self._stats['total'],
-                'error': self._stats['error'],
-                'warning': self._stats['warning'],
-                'info': self._stats['info'],
-                'debug': self._stats['debug'],
+                'total': total,
+                'error': error,
+                'warning': int(self._stats.get('warning', 0)),
+                'info': int(self._stats.get('info', 0)),
+                'debug': int(self._stats.get('debug', 0)),
                 'duration': str(current_time - self._stats_start_time),
                 'by_category': dict(self._stats['by_category']),
                 'by_hour': dict(self._stats['by_hour']),
-                'error_rate': float(self._stats['error_rate']),
+                'error_rate': float(error_rate),
                 'time_since_last_error': str(current_time - self._stats['last_error_time']) if self._stats['last_error_time'] else None
             }
             
@@ -935,12 +944,13 @@ class XmiLogger:
             
             # 获取最近的错误
             if self._stats['errors']:
+                recent_errors = list(self._stats['errors'])[-10:]
                 stats['recent_errors'] = [
                     {
                         'time': str(error['time']),
                         'message': str(error['message'])
                     }
-                    for error in self._stats['errors'][-10:]
+                    for error in recent_errors
                 ]
             
             # 更新缓存
@@ -983,7 +993,7 @@ class XmiLogger:
                 'debug': 0,
                 'by_category': defaultdict(int),
                 'by_hour': defaultdict(int),
-                'errors': [],
+                'errors': deque(maxlen=self._error_history_size),
                 'last_error_time': None,
                 'error_rate': 0.0
             }
@@ -1021,7 +1031,7 @@ class XmiLogger:
         else:
             full_message = message
         
-        logger_opt = self.logger.opt(depth=1)
+        logger_opt = self._logger_d1
         log_method = getattr(logger_opt, level.lower(), logger_opt.info)
         log_method(full_message)
 
@@ -1076,9 +1086,15 @@ class XmiLogger:
             else:
                 self.log(level, message)
 
-    async def async_batch_log(self, logs: List[Dict[str, Any]]) -> None:
-        """异步批量记录日志"""
-        for log_entry in logs:
+    async def async_batch_log(self, logs: List[Dict[str, Any]], yield_every: int = 0, sleep_s: float = 0.0) -> None:
+        """异步批量记录日志
+
+        Args:
+            logs: 日志条目列表
+            yield_every: 每处理 N 条日志让出一次事件循环(0 表示不主动让出)
+            sleep_s: 让出时 sleep 的秒数；为 0 时使用 await asyncio.sleep(0)
+        """
+        for i, log_entry in enumerate(logs, 1):
             level = log_entry.get('level', 'INFO')
             message = log_entry.get('message', '')
             tag = log_entry.get('tag')
@@ -1090,9 +1106,9 @@ class XmiLogger:
                 self.log_with_category(level, message, category)
             else:
                 self.log(level, message)
-            
-            # 小延迟避免阻塞
-            await asyncio.sleep(0.001)
+
+            if yield_every and (i % yield_every == 0):
+                await asyncio.sleep(sleep_s if sleep_s > 0 else 0)
 
     def log_with_context(self, level: str, message: str, context: Dict[str, Any] = None):
         """带上下文的日志记录"""
@@ -1103,7 +1119,7 @@ class XmiLogger:
         else:
             full_message = message
         
-        logger_opt = self.logger.opt(depth=1)
+        logger_opt = self._logger_d1
         log_method = getattr(logger_opt, level.lower(), logger_opt.info)
         log_method(full_message)
 
@@ -1113,7 +1129,7 @@ class XmiLogger:
         timing_str = " | ".join([f"{k}={v:.3f}s" for k, v in timing_data.items()])
         full_message = f"{message} | {timing_str}"
         
-        logger_opt = self.logger.opt(depth=1)
+        logger_opt = self._logger_d1
         log_method = getattr(logger_opt, level.lower(), logger_opt.info)
         log_method(full_message)
 
@@ -1158,24 +1174,28 @@ class XmiLogger:
     def enable_performance_mode(self) -> None:
         """启用性能模式"""
         if self.performance_mode:
-            # 减少日志输出
-            self.filter_level = "WARNING"
-            self._update_logger_level()
-            # 增加缓存大小
-            self._cache_size = min(self._cache_size * 2, 2048)
-            # 禁用详细统计
-            self.enable_stats = False
+            return
+        self.performance_mode = True
+        # 减少日志输出
+        self.filter_level = "WARNING"
+        self._update_logger_level()
+        # 增加缓存大小
+        self._cache_size = min(self._cache_size * 2, 2048)
+        # 禁用详细统计
+        self.enable_stats = False
 
     def disable_performance_mode(self) -> None:
         """禁用性能模式"""
-        if self.performance_mode:
-            # 恢复日志级别
-            self.filter_level = "INFO"
-            self._update_logger_level()
-            # 恢复缓存大小
-            self._cache_size = max(self._cache_size // 2, 128)
-            # 恢复统计功能
-            self.enable_stats = True
+        if not self.performance_mode:
+            return
+        self.performance_mode = False
+        # 恢复日志级别
+        self.filter_level = "INFO"
+        self._update_logger_level()
+        # 恢复缓存大小
+        self._cache_size = max(self._cache_size // 2, 128)
+        # 恢复统计功能
+        self.enable_stats = True
 
     def compress_logs(self, days_old: int = 7) -> None:
         """压缩指定天数之前的日志文件"""

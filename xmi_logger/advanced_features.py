@@ -128,7 +128,9 @@ class LogSecurity:
 
         return sanitized
 
-    def sanitize_mapping(self, data: Any) -> Any:
+    def sanitize_mapping(self, data: Any, _depth: int = 0, max_depth: int = 20) -> Any:
+        if _depth >= max_depth:
+            return self.replacement
         if isinstance(data, Mapping):
             out: Dict[str, Any] = {}
             for k, v in data.items():
@@ -136,12 +138,12 @@ class LogSecurity:
                 if key_str.lower() in self.sensitive_keys:
                     out[key_str] = self.replacement
                 else:
-                    out[key_str] = self.sanitize_mapping(v)
+                    out[key_str] = self.sanitize_mapping(v, _depth + 1, max_depth)
             return out
         if isinstance(data, list):
-            return [self.sanitize_mapping(x) for x in data]
+            return [self.sanitize_mapping(x, _depth + 1, max_depth) for x in data]
         if isinstance(data, tuple):
-            return tuple(self.sanitize_mapping(x) for x in data)
+            return tuple(self.sanitize_mapping(x, _depth + 1, max_depth) for x in data)
         return data
 
     def _init_cipher(self, encryption_key: Optional[Union[str, bytes]]) -> None:
@@ -278,6 +280,13 @@ class LogAggregator:
             self.flush()
         except Exception:
             pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
 
     def _flush_locked(self) -> List[Dict[str, Any]]:
         if not self._buffer:
@@ -527,6 +536,13 @@ class LogDatabase:
             except Exception:
                 pass
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
     def _init_database(self) -> None:
         with self._lock:
             self._conn.execute(
@@ -663,7 +679,9 @@ class LogStreamProcessor:
         self._thread.start()
 
     def add_processor(self, processor: Callable[[Dict[str, Any]], Dict[str, Any]]) -> None:
-        self.processors.append(processor)
+        # processors 列表可能被 _worker 线程遍历，使用锁保护
+        with threading.Lock():
+            self.processors = list(self.processors) + [processor]
 
     def process_log(self, log_entry: Dict[str, Any], block: bool = True, timeout: Optional[float] = None) -> bool:
         try:
@@ -685,6 +703,13 @@ class LogStreamProcessor:
         except Exception:
             pass
         self._thread.join(timeout=timeout)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
 
     def _handle_error(self, exc: Exception, entry: Dict[str, Any]) -> None:
         if self._error_handler is not None:
@@ -784,16 +809,23 @@ class LogAnalyzer:
 
 
 class LogHealthChecker:
+    def __init__(self):
+        self._process = None
+        if psutil is not None:
+            try:
+                self._process = psutil.Process()
+            except Exception:
+                pass
+
     def check_health(self, log_dir: str) -> Dict[str, Any]:
         try:
             total, used, _ = shutil.disk_usage(log_dir)
             disk_usage_percent = (used / total) * 100 if total else 0.0
 
             memory_usage_mb = None
-            if psutil is not None:
+            if self._process is not None:
                 try:
-                    process = psutil.Process()
-                    memory_usage_mb = process.memory_info().rss / 1024 / 1024
+                    memory_usage_mb = self._process.memory_info().rss / 1024 / 1024
                 except Exception:
                     memory_usage_mb = None
 

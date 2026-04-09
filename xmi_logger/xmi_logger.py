@@ -128,9 +128,7 @@ class XmiLogger:
         self.enable_stats = enable_stats
         self.categories = categories or []
         self._cache_size = cache_size
-        self._format_cache: Dict[Any, str] = {}
         self._message_cache: Dict[Any, str] = {}
-        self._location_cache: Dict[Any, str] = {}
         self._stats_cache: Dict[str, Any] = {}
         self._stats_cache_time = 0.0
         self._stats_cache_ttl = 5
@@ -301,13 +299,10 @@ class XmiLogger:
         """确保日志目录存在且可写"""
         try:
             os.makedirs(self.log_dir, exist_ok=True)
-            # 测试目录是否可写
-            test_file = os.path.join(self.log_dir, '.write_test')
-            with open(test_file, 'w') as f:
-                f.write('test')
-            os.remove(test_file)
-        except (OSError, IOError) as e:
-            raise RuntimeError(f"无法创建或写入日志目录: {str(e)}")
+            if not os.access(self.log_dir, os.W_OK):
+                raise RuntimeError(f"日志目录不可写: {self.log_dir}")
+        except OSError as e:
+            raise RuntimeError(f"无法创建日志目录: {str(e)}")
     
     def _get_log_format(self) -> str:
         """获取日志格式"""
@@ -644,15 +639,20 @@ class XmiLogger:
             # 如果日志级别已存在，记录调试信息
             self.logger.debug(f"Log level '{level_name}' already exists, skipping.")
 
-    def __getattr__(self, level: str):
+    def __getattr__(self, name: str):
         """
-        使 MyLogger 支持直接调用 Loguru 的日志级别方法。
+        使 XmiLogger 支持直接调用 Loguru 的日志级别方法。
 
         Args:
-            level (str): 日志级别方法名称。
+            name (str): 属性名称。
         """
-        logger_method = getattr(self._logger_d1, level)
-        return logger_method
+        # 防止初始化异常时 _logger_d1 尚未创建导致无限递归
+        if name.startswith('_'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        try:
+            return getattr(self._logger_d1, name)
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def log(self, level: str, message: str, *args, **kwargs):
         self._update_stats(level)
@@ -788,30 +788,28 @@ class XmiLogger:
             if trace:
                 self.logger.opt(exception=True).error("原始异常堆栈:")
 
+    @staticmethod
+    def _format_value(val):
+        """通用的参数/结果格式化"""
+        try:
+            if isinstance(val, (str, int, float, bool)):
+                return str(val)
+            elif isinstance(val, (list, tuple)):
+                return f"[{len(val)} items]"
+            elif isinstance(val, dict):
+                return f"{{{len(val)} items}}"
+            return str(val)
+        except Exception:
+            return f"<{type(val).__name__}>"
+
     def _log_start(self, func_name, args, kwargs, is_async=False):
         """
         记录函数调用开始的公共逻辑。
         """
-        def format_arg(arg):
-            """优化的参数格式化函数"""
-            try:
-                if isinstance(arg, (str, int, float, bool)):
-                    return str(arg)
-                elif isinstance(arg, (list, tuple)):
-                    return f"[{len(arg)} items]"
-                elif isinstance(arg, dict):
-                    return f"{{{len(arg)} items}}"
-                else:
-                    return str(arg)
-            except Exception:
-                return f"<{type(arg).__name__}>"
-
-        # 安全地格式化参数
-        args_str = [format_arg(arg) for arg in args]
-        kwargs_str = {k: format_arg(v) for k, v in kwargs.items()}
+        args_str = [self._format_value(arg) for arg in args]
+        kwargs_str = {k: self._format_value(v) for k, v in kwargs.items()}
         
         if is_async:
-            self.logger.info(self._msg('START_ASYNC_FUNCTION_CALL'))
             self.logger.info(
                 self._msg('CALLING_ASYNC_FUNCTION', 
                          func=func_name, 
@@ -819,7 +817,6 @@ class XmiLogger:
                          kwargs=kwargs_str)
             )
         else:
-            self.logger.info(self._msg('START_FUNCTION_CALL'))
             self.logger.info(
                 self._msg('CALLING_FUNCTION', 
                          func=func_name, 
@@ -831,23 +828,8 @@ class XmiLogger:
         """
         记录函数调用结束的公共逻辑。
         """
-        def format_result(res):
-            """优化的结果格式化函数"""
-            try:
-                if isinstance(res, (str, int, float, bool)):
-                    return str(res)
-                elif isinstance(res, (list, tuple)):
-                    return f"[{len(res)} items]"
-                elif isinstance(res, dict):
-                    return f"{{{len(res)} items}}"
-                else:
-                    return str(res)
-            except Exception:
-                return f"<{type(res).__name__}>"
-
-        # 安全地格式化结果和持续时间
-        result_str = format_result(result)
-        duration_str = f"{duration:.6f}"  # 格式化持续时间为6位小数
+        result_str = self._format_value(result)
+        duration_str = f"{duration:.6f}"
         
         if is_async:
             self.logger.info(
@@ -856,7 +838,6 @@ class XmiLogger:
                          result=result_str, 
                          duration=duration_str)
             )
-            self.logger.info(self._msg('END_ASYNC_FUNCTION_CALL'))
         else:
             self.logger.info(
                 self._msg('FUNCTION_RETURNED', 
@@ -864,7 +845,6 @@ class XmiLogger:
                          result=result_str, 
                          duration=duration_str)
             )
-            self.logger.info(self._msg('END_FUNCTION_CALL'))
             
     def _update_stats(self, level: str, category: Optional[str] = None) -> None:
         """更新日志统计信息
@@ -1034,20 +1014,11 @@ class XmiLogger:
         return {
             'cache_sizes': {
                 'message_cache': len(self._message_cache),
-                'format_cache': len(self._format_cache),
-                'location_cache': len(self._location_cache),
                 'stats_cache': len(self._stats_cache)
-            },
-            'cache_hit_rates': {
-                'message_cache_hits': getattr(self, '_message_cache_hits', 0),
-                'location_cache_hits': getattr(self, '_location_cache_hits', 0),
-                'stats_cache_hits': getattr(self, '_stats_cache_hits', 0)
             },
             'memory_usage': {
                 'total_cache_size': (
                     len(self._message_cache) + 
-                    len(self._format_cache) + 
-                    len(self._location_cache) + 
                     len(self._stats_cache)
                 )
             },
@@ -1060,8 +1031,6 @@ class XmiLogger:
     def clear_caches(self) -> None:
         """清除所有缓存"""
         self._message_cache.clear()
-        self._format_cache.clear()
-        self._location_cache.clear()
         self._stats_cache.clear()
         self._stats_cache_time = 0
 
@@ -1104,7 +1073,7 @@ class XmiLogger:
             if yield_every and (i % yield_every == 0):
                 await asyncio.sleep(sleep_s if sleep_s > 0 else 0)
 
-    def log_with_context(self, level: str, message: str, context: Dict[str, Any] = None):
+    def log_with_context(self, level: str, message: str, context: Optional[Dict[str, Any]] = None):
         """带上下文的日志记录"""
         self._update_stats(level)
         if context:

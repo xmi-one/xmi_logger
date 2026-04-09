@@ -8,6 +8,7 @@
 
 
 
+from .__version__ import __version__
 from .xmi_logger import XmiLogger
 from .advanced_features import (
     LogFilter,

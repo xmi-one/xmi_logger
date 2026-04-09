@@ -10,9 +10,8 @@ import os
 import sys
 import time
 import inspect
-import requests
+import logging
 import asyncio
-import aiohttp
 
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -197,56 +196,32 @@ class XmiLogger:
         self._stats_start_time = datetime.now()
 
     def _msg(self, key: str, **kwargs) -> str:
-        """消息格式化处理，优化性能"""
+        """消息格式化处理，优化性能
+
+        对无参消息缓存模板文本；对有参消息直接格式化（参数通常每次不同，
+        缓存命中率极低，省去昂贵的 key 序列化开销）。
+        """
         try:
-            # 获取消息模板
-            text = self._LANG_MAP.get(self.language, {}).get(key, key)
-            
-            # 如果没有参数，直接返回模板
+            # 无参消息：直接缓存模板
             if not kwargs:
-                cache_key = (self.language, key, None)
-                if cache_key in self._message_cache:
-                    return self._message_cache[cache_key]
+                cache_key = (self.language, key)
+                cached = self._message_cache.get(cache_key)
+                if cached is not None:
+                    return cached
+                text = self._LANG_MAP.get(self.language, {}).get(key, key)
                 self._message_cache[cache_key] = text
                 return text
-            
-            # 优化参数转换
+
+            # 有参消息：直接格式化，不做缓存
+            text = self._LANG_MAP.get(self.language, {}).get(key, key)
             str_kwargs = {}
             for k, v in kwargs.items():
                 try:
-                    if isinstance(v, (list, tuple)):
-                        str_kwargs[k] = tuple(str(item) for item in v)
-                    elif isinstance(v, dict):
-                        str_kwargs[k] = {str(kk): str(vv) for kk, vv in v.items()}
-                    else:
-                        str_kwargs[k] = str(v)
+                    str_kwargs[k] = str(v)
                 except Exception:
                     str_kwargs[k] = f"<{type(v).__name__}>"
+            return text.format(**str_kwargs)
 
-            frozen_kwargs = tuple(
-                sorted(
-                    (k, tuple(sorted(v.items())) if isinstance(v, dict) else v)
-                    for k, v in str_kwargs.items()
-                )
-            )
-            cache_key = (self.language, key, frozen_kwargs)
-            if cache_key in self._message_cache:
-                return self._message_cache[cache_key]
-            
-            # 格式化消息
-            result = text.format(**str_kwargs)
-            
-            # 缓存结果
-            self._message_cache[cache_key] = result
-            
-            # 限制缓存大小
-            if len(self._message_cache) > self._cache_size:
-                # 清除最旧的缓存项
-                oldest_key = next(iter(self._message_cache))
-                del self._message_cache[oldest_key]
-            
-            return result
-            
         except KeyError as e:
             text = self._LANG_MAP.get(self.language, {}).get(key, key)
             return f"{text} (格式化错误: 缺少参数 {e})"
@@ -520,6 +495,8 @@ class XmiLogger:
             return
 
         def remote_thread_target():
+            import aiohttp
+
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             queue = asyncio.Queue()
@@ -560,7 +537,7 @@ class XmiLogger:
         self._remote_thread.start()
         self._remote_ready.wait(timeout=2)
 
-    async def _post_remote_payload(self, session: aiohttp.ClientSession, payload: Dict[str, Any]) -> None:
+    async def _post_remote_payload(self, session, payload: Dict[str, Any]) -> None:
         for attempt in range(3):
             try:
                 async with session.post(
@@ -629,6 +606,8 @@ class XmiLogger:
         self._remote_ready.clear()
 
     def _send_payload_sync(self, payload: Dict[str, Any]) -> None:
+        import requests
+
         headers = {"Content-Type": "application/json"}
         max_retries = 3
         retry_delay = 1
@@ -888,30 +867,45 @@ class XmiLogger:
             self.logger.info(self._msg('END_FUNCTION_CALL'))
             
     def _update_stats(self, level: str, category: Optional[str] = None) -> None:
-        """更新日志统计信息"""
+        """更新日志统计信息
+
+        优化：将 strftime 等耗时操作移到锁外，减少持锁时间。
+        """
         if not self.enable_stats:
             return
-            
+
+        level_key = level.lower()
+        level_upper = level.upper()
+        is_error = level_upper == 'ERROR'
+
+        # 仅在需要时获取时间（小时分布 + 错误记录）
+        now_dt = datetime.now()
+        current_hour = now_dt.strftime('%Y-%m-%d %H:00')
+
         with self._stats_lock:
-            now_dt = datetime.now()
             self._stats['total'] += 1
-            level_key = level.lower()
             if level_key not in self._stats:
                 self._stats[level_key] = 0
             self._stats[level_key] += 1
-            
+
             if category:
                 self._stats['by_category'][category] += 1
-            
-            current_hour = now_dt.strftime('%Y-%m-%d %H:00')
+
             self._stats['by_hour'][current_hour] += 1
-            
-            if level.upper() == 'ERROR':
+
+            if is_error:
                 self._stats['errors'].append({
                     'time': now_dt,
                     'message': f"Error occurred at {current_hour}"
                 })
                 self._stats['last_error_time'] = now_dt
+
+        # 自适应日志级别：每 500 条日志自动检查一次
+        if self.adaptive_level and self._stats['total'] % 500 == 0:
+            try:
+                self.set_adaptive_level()
+            except Exception:
+                pass
     
     def get_stats(self) -> Dict[str, Any]:
         """获取详细的日志统计信息，优化性能"""
@@ -1271,6 +1265,7 @@ class XmiLogger:
         """分析指定时间范围内的日志"""
         from pathlib import Path
         import re
+        from collections import Counter
         
         log_path = Path(self.log_dir)
         current_time = datetime.now()
@@ -1292,32 +1287,56 @@ class XmiLogger:
         
         error_pattern = re.compile(r'ERROR.*?(\w+Error|Exception)', re.IGNORECASE)
         warning_pattern = re.compile(r'WARNING.*?(\w+Warning)', re.IGNORECASE)
+        # 匹配日志行开头的时间戳，格式如 2025-01-03 14:05:23.456
+        timestamp_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})')
         
         for log_file in log_path.glob(f"{self.file_name}*.log"):
             try:
+                # 按文件修改时间快速跳过明显过旧的文件
+                file_mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                if file_mtime < start_time:
+                    continue
+                
                 with open(log_file, 'r', encoding='utf-8') as f:
                     for line in f:
-                        # 解析日志行
+                        # 解析日志行时间戳，过滤不在时间范围内的行
+                        ts_match = timestamp_pattern.search(line)
+                        if ts_match:
+                            try:
+                                log_time = datetime.strptime(ts_match.group(1), '%Y-%m-%d %H:%M:%S')
+                                if log_time < start_time:
+                                    continue
+                            except ValueError:
+                                pass  # 解析失败则不过滤，继续处理
+                        
+                        analysis['total_logs'] += 1
+                        
+                        # 记录每小时分布
+                        if ts_match:
+                            try:
+                                hour_key = log_time.strftime('%Y-%m-%d %H:00')
+                                analysis['hourly_distribution'][hour_key] += 1
+                            except Exception:
+                                pass
+                        
+                        # 记录文件分布
+                        analysis['file_distribution'][log_file.name] += 1
+                        
+                        # 解析日志级别
                         if 'ERROR' in line:
                             analysis['error_count'] += 1
-                            # 提取错误类型
                             error_match = error_pattern.search(line)
                             if error_match:
-                                error_type = error_match.group(1)
-                                analysis['top_errors'].append(error_type)
+                                analysis['top_errors'].append(error_match.group(1))
                         elif 'WARNING' in line:
                             analysis['warning_count'] += 1
-                            # 提取警告类型
                             warning_match = warning_pattern.search(line)
                             if warning_match:
-                                warning_type = warning_match.group(1)
-                                analysis['top_warnings'].append(warning_type)
+                                analysis['top_warnings'].append(warning_match.group(1))
                         elif 'INFO' in line:
                             analysis['info_count'] += 1
                         elif 'DEBUG' in line:
                             analysis['debug_count'] += 1
-                        
-                        analysis['total_logs'] += 1
                         
             except Exception as e:
                 self.logger.error(f"分析日志文件失败 {log_file.name}: {e}")
@@ -1327,7 +1346,6 @@ class XmiLogger:
             analysis['error_rate'] = analysis['error_count'] / analysis['total_logs']
         
         # 统计最常见的错误和警告
-        from collections import Counter
         analysis['top_errors'] = Counter(analysis['top_errors']).most_common(10)
         analysis['top_warnings'] = Counter(analysis['top_warnings']).most_common(10)
         
@@ -1359,37 +1377,68 @@ class XmiLogger:
         return report
 
     def export_logs_to_json(self, output_file: str, hours: int = 24) -> None:
-        """导出日志到JSON文件"""
+        """导出日志到JSON文件（流式写入，避免大文件 OOM）"""
         import json
+        import re
         from pathlib import Path
         
         log_path = Path(self.log_dir)
         current_time = datetime.now()
         start_time = current_time - timedelta(hours=hours)
-        
-        logs_data = []
-        
-        for log_file in log_path.glob(f"{self.file_name}*.log"):
-            try:
-                with open(log_file, 'r', encoding='utf-8') as f:
-                    for line_num, line in enumerate(f, 1):
-                        log_entry = {
-                            'file': log_file.name,
-                            'line_number': line_num,
-                            'content': line.strip(),
-                            'timestamp': current_time.isoformat()
-                        }
-                        logs_data.append(log_entry)
-                        
-            except Exception as e:
-                self.logger.error(f"导出日志文件失败 {log_file.name}: {e}")
+        timestamp_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})')
         
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(logs_data, f, ensure_ascii=False, indent=2)
+            with open(output_file, 'w', encoding='utf-8') as out:
+                out.write('[\n')
+                first = True
+                
+                for log_file in log_path.glob(f"{self.file_name}*.log"):
+                    try:
+                        # 跳过明显过旧的文件
+                        file_mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                        if file_mtime < start_time:
+                            continue
+                        
+                        with open(log_file, 'r', encoding='utf-8') as f:
+                            for line_num, line in enumerate(f, 1):
+                                # 解析时间戳用于过滤和记录
+                                log_timestamp = current_time.isoformat()
+                                ts_match = timestamp_pattern.search(line)
+                                if ts_match:
+                                    try:
+                                        log_time = datetime.strptime(ts_match.group(1), '%Y-%m-%d %H:%M:%S')
+                                        if log_time < start_time:
+                                            continue
+                                        log_timestamp = log_time.isoformat()
+                                    except ValueError:
+                                        pass
+                                
+                                if not first:
+                                    out.write(',\n')
+                                json.dump({
+                                    'file': log_file.name,
+                                    'line_number': line_num,
+                                    'content': line.strip(),
+                                    'timestamp': log_timestamp
+                                }, out, ensure_ascii=False)
+                                first = False
+                                
+                    except Exception as e:
+                        self.logger.error(f"导出日志文件失败 {log_file.name}: {e}")
+                
+                out.write('\n]')
             self.logger.info(f"日志已导出到: {output_file}")
         except Exception as e:
             self.logger.error(f"导出JSON文件失败: {e}")
+
+    def __enter__(self):
+        """支持 with 语句，自动管理资源生命周期"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出 with 语句时自动清理资源"""
+        self.cleanup()
+        return False
 
     def cleanup(self) -> None:
         """清理资源"""
@@ -1415,6 +1464,5 @@ class XmiLogger:
             self._executor = None
         self._remove_handlers()
         self.clear_caches()
-        import gc
-        gc.collect()
-        print("XmiLogger 资源清理完成")
+        _logger = logging.getLogger(__name__)
+        _logger.info("XmiLogger 资源清理完成")

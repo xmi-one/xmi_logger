@@ -192,6 +192,10 @@ class DistributedLogger:
         self._sequence_file = str(base_dir / f"sequence_{self.node_id}.txt")
         self._load_sequence()
 
+        # 进程退出时自动持久化序列号，避免崩溃后丢失
+        import atexit
+        atexit.register(self.flush)
+
     def _load_sequence(self) -> None:
         try:
             if os.path.exists(self._sequence_file):
@@ -330,6 +334,7 @@ class PerformanceMonitor:
 
         self._start_time = time.time()
         self._processing_times: deque[float] = deque(maxlen=1000)
+        self._running_sum: float = 0.0
         self._metrics: Dict[str, Any] = {
             "log_count": 0,
             "error_count": 0,
@@ -348,10 +353,19 @@ class PerformanceMonitor:
             self._metrics["log_count"] += 1
             if str(level).upper() == "ERROR":
                 self._metrics["error_count"] += 1
-            self._processing_times.append(float(processing_time_sec))
-            if self._processing_times:
-                avg_ms = (sum(self._processing_times) / len(self._processing_times)) * 1000.0
-                self._metrics["avg_processing_time_ms"] = avg_ms
+
+            pt = float(processing_time_sec)
+
+            # 当 deque 已满时，减去即将被淘汰的最旧值
+            if len(self._processing_times) >= self._processing_times.maxlen:
+                self._running_sum -= self._processing_times[0]
+
+            self._processing_times.append(pt)
+            self._running_sum += pt
+
+            n = len(self._processing_times)
+            if n > 0:
+                self._metrics["avg_processing_time_ms"] = (self._running_sum / n) * 1000.0
 
     def get_metrics(self) -> Dict[str, Any]:
         with self._lock:
@@ -464,11 +478,18 @@ class LogDatabase:
         "extra_data",
     }
 
+    _INSERT_SQL = (
+        "INSERT INTO logs (timestamp, level, message, file, line, function, process_id, thread_id, extra_data) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
     def __init__(
         self,
         db_path: str = "logs.db",
         enable_wal: bool = True,
         busy_timeout_ms: int = 5000,
+        batch_size: int = 100,
+        flush_interval: float = 1.0,
     ):
         self.db_path = db_path
         self._lock = threading.Lock()
@@ -483,10 +504,24 @@ class LogDatabase:
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
         except Exception:
             pass
+
+        self._batch_size = max(1, int(batch_size))
+        self._flush_interval = max(0.1, float(flush_interval))
+        self._pending: List[tuple] = []
+        self._stop = threading.Event()
+        self._flush_thread = threading.Thread(target=self._flush_worker, daemon=True)
+
         self._init_database()
+        self._flush_thread.start()
 
     def close(self) -> None:
+        self._stop.set()
+        try:
+            self._flush_thread.join(timeout=2)
+        except Exception:
+            pass
         with self._lock:
+            self._flush_pending()
             try:
                 self._conn.close()
             except Exception:
@@ -514,34 +549,57 @@ class LogDatabase:
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level)")
             self._conn.commit()
 
+    @staticmethod
+    def _to_row(e: Mapping[str, Any]) -> tuple:
+        return (
+            e.get("timestamp") or _now_iso(),
+            e.get("level") or "INFO",
+            e.get("message") or "",
+            e.get("file"),
+            e.get("line"),
+            e.get("function"),
+            e.get("process_id"),
+            e.get("thread_id"),
+            json.dumps(e.get("extra_data") or {}, ensure_ascii=False),
+        )
+
     def insert_log(self, log_entry: Mapping[str, Any]) -> None:
-        self.insert_many([log_entry])
+        """单条插入，缓冲到批次后统一提交"""
+        row = self._to_row(log_entry)
+        with self._lock:
+            self._pending.append(row)
+            if len(self._pending) >= self._batch_size:
+                self._flush_pending()
 
     def insert_many(self, log_entries: Sequence[Mapping[str, Any]]) -> None:
-        rows = []
-        for e in log_entries:
-            rows.append(
-                (
-                    e.get("timestamp") or _now_iso(),
-                    e.get("level") or "INFO",
-                    e.get("message") or "",
-                    e.get("file"),
-                    e.get("line"),
-                    e.get("function"),
-                    e.get("process_id"),
-                    e.get("thread_id"),
-                    json.dumps(e.get("extra_data") or {}, ensure_ascii=False),
-                )
-            )
+        """批量插入，立即提交"""
+        rows = [self._to_row(e) for e in log_entries]
         with self._lock:
-            self._conn.executemany(
-                """
-                INSERT INTO logs (timestamp, level, message, file, line, function, process_id, thread_id, extra_data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
+            self._conn.executemany(self._INSERT_SQL, rows)
             self._conn.commit()
+
+    def flush(self) -> None:
+        """手动刷新缓冲区"""
+        with self._lock:
+            self._flush_pending()
+
+    def _flush_pending(self) -> None:
+        """将缓冲区中的行写入数据库（调用方需持有 _lock）"""
+        if not self._pending:
+            return
+        self._conn.executemany(self._INSERT_SQL, self._pending)
+        self._conn.commit()
+        self._pending.clear()
+
+    def _flush_worker(self) -> None:
+        """后台定时刷新线程"""
+        while not self._stop.is_set():
+            self._stop.wait(self._flush_interval)
+            if self._stop.is_set():
+                break
+            with self._lock:
+                self._flush_pending()
+
 
     def query_logs(
         self,
@@ -789,13 +847,22 @@ class LogBackupManager:
             base = Path(restore_dir)
             _ensure_dir(base)
             with tarfile.open(backup_path, "r:gz") as tar:
-                for member in tar.getmembers():
-                    if not member.name or member.name.startswith("/") or ".." in Path(member.name).parts:
-                        raise RuntimeError(f"不安全的备份成员路径: {member.name}")
-                    target = base / member.name
-                    if not _is_within_directory(base, target):
-                        raise RuntimeError(f"不安全的备份成员路径: {member.name}")
-                tar.extractall(str(base))
+                # Python 3.12+ 支持 filter 参数，更安全
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(str(base), filter="data")
+                else:
+                    # 逐个验证并提取，避免 TOCTOU 竞态条件
+                    for member in tar.getmembers():
+                        if not member.name or member.name.startswith("/") or ".." in Path(member.name).parts:
+                            raise RuntimeError(f"不安全的备份成员路径: {member.name}")
+                        target = base / member.name
+                        if not _is_within_directory(base, target):
+                            raise RuntimeError(f"不安全的备份成员路径: {member.name}")
+                        # 仅提取普通文件和目录，跳过符号链接等
+                        if member.isfile() or member.isdir():
+                            tar.extract(member, str(base))
+                        else:
+                            _logger.warning("跳过非常规备份成员: %s (类型: %s)", member.name, member.type)
             return True
         except Exception:
             _logger.exception("恢复备份失败")
